@@ -1,226 +1,49 @@
-"""Now-playing player card (1280x720) with soft glowing buttons and lines.
+"""Now-playing player card (1280x720), music-app style.
 
     path = await make_player_card(videoid)
 
-Used by both thumbnail modules (main bot + clone bots). Everything is drawn at
-2x and scaled down, so edges stay smooth.
+* blurred, desaturated cover as background, rounded square album art on the left
+* title / artist / star + more buttons / progress / volume / transport icons
+* everything is drawn at 2x and scaled down, so edges stay smooth
+* saved as an optimised JPEG (~60-120 KB) and old cards are pruned from
+  cache/ automatically, so thumbnails never fill the disk
 """
 
 import asyncio
+import glob
 import math
 import os
+import time
 from io import BytesIO
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 W, H, S = 1280, 720, 2
-GLOW_ON = True  # set False to switch the glow off everywhere
 
 ASSETS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
+CACHE_DIR = "cache"
+CARD_GLOB = os.path.join(CACHE_DIR, "roohi_*")
+KEEP_FILES = 40          # newest cards that are always kept
+MAX_AGE = 2 * 3600       # anything older than this (seconds) is deleted
+JPEG_QUALITY = 86
+
 WHITE = (255, 255, 255, 255)
-SOFT = (240, 240, 240, 255)
+ICON = (247, 247, 247, 255)
 
 
+# ---------------------------------------------------------------- helpers
 def _font(name, size):
-    for n in (name, "font2.ttf", "font.ttf"):
+    for n in (name, "pc_bold.ttf", "font2.ttf"):
         try:
-            return ImageFont.truetype(os.path.join(ASSETS, n), int(size * S))
+            return ImageFont.truetype(os.path.join(ASSETS, n), int(round(size * S)))
         except Exception:
             continue
     return ImageFont.load_default()
 
 
-def _fit_text(draw, text, font, max_w):
-    text = str(text or "").strip() or "Unknown"
-    if draw.textlength(text, font=font) <= max_w * S:
-        return text
-    while text and draw.textlength(text + "...", font=font) > max_w * S:
-        text = text[:-1]
-    return text.rstrip() + "..."
-
-
-def _p(x, y):
-    return (x * S, y * S)
-
-
-def _poly(pts, ox=0.0, oy=0.0, k=1.0):
-    return [((ox + x * k) * S, (oy + y * k) * S) for x, y in pts]
-
-
-# ---------------------------------------------------------------- background
-def _background(img):
-    small = ImageOps.fit(img.convert("RGB"), (W // 4, H // 4))
-    bg = small.filter(ImageFilter.GaussianBlur(14)).resize((W * S, H * S), Image.LANCZOS)
-    gray = ImageOps.grayscale(bg).convert("RGB")
-    bg = Image.blend(bg, gray, 0.78)
-    bg = ImageEnhance.Brightness(bg).enhance(0.7)
-    bg = ImageEnhance.Contrast(bg).enhance(0.9)
-
-    grad = Image.new("L", (1, H * S))
-    for y in range(H * S):
-        t = y / (H * S)
-        if t < 0.27:
-            a = 255 * (1 - t / 0.27) ** 1.4
-        elif t > 0.73:
-            a = 255 * ((t - 0.73) / 0.27) ** 1.4
-        else:
-            a = 0
-        grad.putpixel((0, y), int(a))
-    mask = grad.resize((W * S, H * S))
-    return Image.composite(Image.new("RGB", (W * S, H * S), (0, 0, 0)), bg, mask)
-
-
-def _glow(base, layer, radius, strength):
-    g = layer.filter(ImageFilter.GaussianBlur(radius * S))
-    a = g.split()[3].point(lambda v: min(255, int(v * strength)))
-    g.putalpha(a)
-    base.alpha_composite(g)
-
-
-# ---------------------------------------------------------------- icons
-def _star(d, cx, cy, ro, ri, color, w):
-    pts = []
-    for i in range(10):
-        ang = math.radians(-90 + i * 36)
-        r = ro if i % 2 == 0 else ri
-        pts.append(((cx + r * math.cos(ang)) * S, (cy + r * math.sin(ang)) * S))
-    d.line(pts + [pts[0]], fill=color, width=int(w * S), joint="curve")
-
-
-def _arc_up(d, box, color, w, a0=125, a1=55):
-    x0, y0, x1, y1 = [v * S for v in box]
-    d.arc((x0, y0, x1, y1), start=a0, end=360, fill=color, width=int(w * S))
-    d.arc((x0, y0, x1, y1), start=0, end=a1, fill=color, width=int(w * S))
-
-
-def _speaker(d, ox, oy, k, color, waves):
-    d.polygon(_poly([(3, 9), (8, 9), (13, 5), (13, 19), (8, 15), (3, 15)], ox, oy, k), fill=color)
-    if waves:
-        cx, cy = (ox + 12 * k) * S, (oy + 12 * k) * S
-        for r in (5.5 * k, 9.5 * k):
-            R = r * S
-            d.arc((cx - R, cy - R, cx + R, cy + R), start=-50, end=50, fill=color, width=int(1.8 * S))
-
-
-def _ui(d, G, title, artist, duration, f_title):
-    """Draw every bright element. G=True -> pure white (used as the glow source)."""
-    c = (lambda col: WHITE) if G else (lambda col: col)
-
-    # title
-    d.text(_p(718, 126), title, font=f_title, fill=c(WHITE))
-
-    # star + dots
-    _star(d, 1096, 164, 11.5, 5.0, c((232, 232, 232, 255)), 2.0)
-    for dx in (-8, 0, 8):
-        x, y, r = (1164 + dx) * S, 164 * S, 2.4 * S
-        d.ellipse((x - r, y - r, x + r, y + r), fill=c((232, 232, 232, 255)))
-
-    # progress fill
-    d.rounded_rectangle((718 * S, 224 * S, 1116 * S, 234 * S), radius=5 * S, fill=WHITE)
-
-    # transport: rewind, pause, forward
-    ctl = c(SOFT)
-    for pts in ([(799, 345), (775, 360), (799, 375)], [(825, 345), (801, 360), (825, 375)],
-                [(1105, 345), (1129, 360), (1105, 375)], [(1079, 345), (1103, 360), (1079, 375)]):
-        sp = [(x * S, y * S) for x, y in pts]
-        d.polygon(sp, fill=ctl)
-        d.line(sp + [sp[0]], fill=ctl, width=3 * S, joint="curve")
-    d.rounded_rectangle((930 * S, 331 * S, 946 * S, 389 * S), radius=4 * S, fill=ctl)
-    d.rounded_rectangle((958 * S, 331 * S, 974 * S, 389 * S), radius=4 * S, fill=ctl)
-
-    # volume fill + speakers
-    d.rounded_rectangle((755 * S, 479 * S, 837 * S, 489 * S), radius=5 * S, fill=WHITE)
-    _speaker(d, 720, 474, 0.833, c((240, 240, 240, 255)), False)
-    _speaker(d, 1156, 474, 0.917, c((240, 240, 240, 255)), True)
-
-    # bottom icons
-    ic = c((232, 232, 232, 255))
-    # lyrics bubble
-    ox, oy = 818, 550
-    d.rounded_rectangle(((ox + 2) * S, (oy + 3) * S, (ox + 46) * S, (oy + 31) * S), radius=5 * S, outline=ic, width=3 * S)
-    d.polygon(_poly([(24, 31), (12, 41), (12, 31)], ox, oy), fill=ic)
-    for qx in (15, 29):
-        x, y, r = (ox + qx) * S, (oy + 16) * S, 3.2 * S
-        d.ellipse((x - r, y - r, x + r, y + r), fill=ic)
-        d.line([(x + 2.4 * S, y), (x - 1.0 * S, y + 6.5 * S)], fill=ic, width=int(2.2 * S))
-    # airplay
-    ox, oy = 928, 549
-    _arc_up(d, (ox + 6, oy + 4, ox + 42, oy + 40), ic, 3)
-    _arc_up(d, (ox + 14, oy + 12, ox + 34, oy + 32), ic, 3)
-    d.polygon(_poly([(24, 28), (12, 45), (36, 45)], ox, oy), fill=ic)
-    # queue list
-    ox, oy = 1032, 553
-    for ly in (5, 19, 33):
-        r = 1.9 * S
-        d.ellipse(((ox + 4) * S - r, (oy + ly) * S - r, (ox + 4) * S + r, (oy + ly) * S + r), fill=ic)
-        d.line([((ox + 14) * S, (oy + ly) * S), ((ox + 44) * S, (oy + ly) * S)], fill=ic, width=int(3.4 * S))
-        for ex in (14, 44):
-            rr = 1.7 * S
-            d.ellipse(((ox + ex) * S - rr, (oy + ly) * S - rr, (ox + ex) * S + rr, (oy + ly) * S + rr), fill=ic)
-
-
-def render_card_old(thumb, title, artist, duration):
-    base = _background(thumb).convert("RGBA")
-    f_title = _font("pc_bold.ttf", 44)
-    f_artist = _font("pc_semibold.ttf", 28)
-    f_time = _font("pc_semibold.ttf", 21)
-
-    probe = ImageDraw.Draw(base)
-    title = _fit_text(probe, title, f_title, 340)
-    artist = _fit_text(probe, artist, f_artist, 440)
-
-    # album art: black rounded square, image fitted to its width
-    art = Image.new("RGBA", (500 * S, 500 * S), (0, 0, 0, 255))
-    pic = ImageOps.fit(thumb.convert("RGB"), (500 * S, 375 * S), centering=(0.5, 0.5))
-    art.paste(pic, (0, 62 * S))
-    mask = Image.new("L", art.size, 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, 500 * S - 1, 500 * S - 1), radius=48 * S, fill=255)
-
-    halo = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    ImageDraw.Draw(halo).rounded_rectangle((114 * S, 110 * S, 614 * S, 610 * S), radius=48 * S, fill=WHITE)
-    if GLOW_ON:
-        g = halo.filter(ImageFilter.GaussianBlur(26 * S))
-        g.putalpha(g.split()[3].point(lambda v: int(v * 0.30)))
-        base.alpha_composite(g)
-    base.paste(art, (114 * S, 110 * S), mask)
-
-    d = ImageDraw.Draw(base)
-    # static (non glowing) parts
-    d.ellipse((1073 * S, 141 * S, 1119 * S, 187 * S), fill=(150, 95, 95, 140))
-    d.ellipse((1141 * S, 141 * S, 1187 * S, 187 * S), fill=(120, 120, 120, 140))
-    d.text(_p(718, 182), artist, font=f_artist, fill=(255, 255, 255, 140))
-    d.rounded_rectangle((718 * S, 224 * S, 1186 * S, 234 * S), radius=5 * S, fill=(255, 255, 255, 80))
-    d.text(_p(718, 246), "0:10", font=f_time, fill=(255, 255, 255, 170))
-    dur = str(duration or "0:00")
-    d.text((1186 * S - d.textlength(dur, font=f_time), 246 * S), dur, font=f_time, fill=(255, 255, 255, 215))
-    d.rounded_rectangle((755 * S, 479 * S, 1137 * S, 489 * S), radius=5 * S, fill=(255, 200, 205, 140))
-
-    if GLOW_ON:
-        gl = Image.new("RGBA", base.size, (0, 0, 0, 0))
-        _ui(ImageDraw.Draw(gl), True, title, artist, duration, f_title)
-        _glow(base, gl, 9, 1.0)
-        _glow(base, gl, 3, 0.9)
-        # soft halo on the two round buttons
-        hb = Image.new("RGBA", base.size, (0, 0, 0, 0))
-        hd = ImageDraw.Draw(hb)
-        for x0 in (1073, 1141):
-            hd.ellipse((x0 * S, 141 * S, (x0 + 46) * S, 187 * S), fill=WHITE)
-        g = hb.filter(ImageFilter.GaussianBlur(10 * S))
-        g.putalpha(g.split()[3].point(lambda v: int(v * 0.28)))
-        base.alpha_composite(g)
-
-    _ui(ImageDraw.Draw(base), False, title, artist, duration, f_title)
-    return base.convert("RGB").resize((W, H), Image.LANCZOS)
-
-
-# ---------------------------------------------------------------- ROOHI glass card
-# Layout follows the reference: blurred cover background, glass panel with a
-# blue / pink / green glowing border, rounded album art, title, channel,
-# green progress bar and a row of coloured player icons.
-
 def _safe_text(text):
-    """Poppins has no Devanagari / emoji etc. -> transliterate so no boxes show."""
+    """Inter has no Devanagari / emoji etc. -> transliterate so no boxes show."""
     text = str(text or "").strip()
     if any(ord(c) > 0x024F for c in text):
         try:
@@ -231,151 +54,194 @@ def _safe_text(text):
     return " ".join(text.split()) or "Unknown"
 
 
-def _gradient_ring(size, box, radius, width, stops):
-    """Rounded-rect outline filled with a horizontal multi-stop gradient."""
-    w, h = size
-    grad = Image.new("RGBA", (w, 1))
-    n = len(stops) - 1
-    gx0, gx1 = int(box[0]), int(box[2])
-    for x in range(w):
-        t = min(1.0, max(0.0, (x - gx0) / max(1, gx1 - gx0)))
-        i = min(n - 1, int(t * n))
-        lt = t * n - i
-        c0, c1 = stops[i], stops[i + 1]
-        grad.putpixel((x, 0), tuple(int(c0[k] + (c1[k] - c0[k]) * lt) for k in range(3)) + (255,))
-    grad = grad.resize((w, h))
-    mask = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(mask).rounded_rectangle(box, radius=radius, outline=255, width=width)
-    ring = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    ring.paste(grad, (0, 0), mask)
-    return ring
+def _fit(draw, text, font, max_w):
+    if draw.textlength(text, font=font) <= max_w * S:
+        return text
+    while text and draw.textlength(text + " ...", font=font) > max_w * S:
+        text = text[:-1]
+    return text.rstrip() + " ..."
 
 
-def _glow_ring(base, ring, blur, strength):
-    g = ring.filter(ImageFilter.GaussianBlur(blur))
-    g.putalpha(g.split()[3].point(lambda v: min(255, int(v * strength))))
-    base.alpha_composite(g)
-    base.alpha_composite(ring)
+def _secs(duration):
+    try:
+        return sum(int(x) * 60 ** i for i, x in enumerate(reversed(str(duration).split(":"))))
+    except Exception:
+        return 0
 
 
-BORDER = [(90, 160, 255), (255, 120, 180), (155, 226, 45), (155, 226, 45), (255, 120, 180)]
-GREEN = (126, 211, 33, 255)
+def _fmt(sec):
+    sec = max(0, int(sec))
+    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def _icon_row(d, y, k):
-    """shuffle, repeat, prev, pause, next, heart, headphones (k = scale)."""
-    def P(x, yy):
-        return (x * k, yy * k)
-
-    lw = int(3.2 * k)
-    # shuffle (green)
-    x = 628
-    g = (80, 230, 140, 255)
-    d.line([P(x, y - 8), P(x + 10, y - 8), P(x + 22, y + 8), P(x + 30, y + 8)], fill=g, width=lw, joint="curve")
-    d.line([P(x, y + 8), P(x + 10, y + 8), P(x + 22, y - 8), P(x + 30, y - 8)], fill=g, width=lw, joint="curve")
-    d.polygon([P(x + 28, y - 13), P(x + 35, y - 8), P(x + 28, y - 3)], fill=g)
-    d.polygon([P(x + 28, y + 3), P(x + 35, y + 8), P(x + 28, y + 13)], fill=g)
-    # repeat (orange)
-    x = 698
-    o = (245, 166, 35, 255)
-    d.arc((P(x - 13, y - 13)[0], P(x - 13, y - 13)[1], P(x + 13, y + 13)[0], P(x + 13, y + 13)[1]),
-          start=200, end=500, fill=o, width=lw)
-    d.polygon([P(x + 9, y - 20), P(x + 18, y - 12), P(x + 7, y - 7)], fill=o)
-    W = (255, 255, 255, 255)
-    # prev
-    x = 752
-    d.rectangle((P(x - 14, y - 11)[0], P(x - 14, y - 11)[1], P(x - 10, y + 11)[0], P(x - 10, y + 11)[1]), fill=W)
-    d.polygon([P(x - 10, y), P(x + 2, y - 11), P(x + 2, y + 11)], fill=W)
-    d.polygon([P(x + 2, y), P(x + 14, y - 11), P(x + 14, y + 11)], fill=W)
-    # pause
-    x = 808
-    d.rounded_rectangle((P(x - 10, y - 13)[0], P(x - 10, y - 13)[1], P(x - 3, y + 13)[0], P(x - 3, y + 13)[1]), radius=int(2 * k), fill=W)
-    d.rounded_rectangle((P(x + 3, y - 13)[0], P(x + 3, y - 13)[1], P(x + 10, y + 13)[0], P(x + 10, y + 13)[1]), radius=int(2 * k), fill=W)
-    # next
-    x = 864
-    d.polygon([P(x - 14, y - 11), P(x - 2, y), P(x - 14, y + 11)], fill=W)
-    d.polygon([P(x - 2, y - 11), P(x + 10, y), P(x - 2, y + 11)], fill=W)
-    d.rectangle((P(x + 10, y - 11)[0], P(x + 10, y - 11)[1], P(x + 14, y + 11)[0], P(x + 14, y + 11)[1]), fill=W)
-    # heart (red)
-    x = 920
-    r = (240, 60, 60, 255)
-    d.ellipse((P(x - 14, y - 12)[0], P(x - 14, y - 12)[1], P(x, y + 2)[0], P(x, y + 2)[1]), fill=r)
-    d.ellipse((P(x, y - 12)[0], P(x, y - 12)[1], P(x + 14, y + 2)[0], P(x + 14, y + 2)[1]), fill=r)
-    d.polygon([P(x - 13.5, y - 2), P(x + 13.5, y - 2), P(x, y + 13)], fill=r)
-    # headphones
-    x = 976
-    d.arc((P(x - 14, y - 14)[0], P(x - 14, y - 14)[1], P(x + 14, y + 14)[0], P(x + 14, y + 14)[1]),
-          start=180, end=360, fill=W, width=lw)
-    d.rounded_rectangle((P(x - 16, y)[0], P(x - 16, y)[1], P(x - 8, y + 14)[0], P(x - 8, y + 14)[1]), radius=int(3 * k), fill=W)
-    d.rounded_rectangle((P(x + 8, y)[0], P(x + 8, y)[1], P(x + 16, y + 14)[0], P(x + 16, y + 14)[1]), radius=int(3 * k), fill=W)
+def _bot_name():
+    try:
+        from RoohiClone import app
+        name = (app.me.first_name if app.me else None) or app.name
+        return _safe_text(name)
+    except Exception:
+        return "Music Bot"
 
 
-def render_card(thumb, title, artist, duration):
-    k = S
-    Wk, Hk = W * k, H * k
+# ---------------------------------------------------------------- background + art
+def _background(thumb):
+    small = ImageOps.fit(thumb, (320, 180), Image.LANCZOS).filter(ImageFilter.GaussianBlur(3.6))
+    bg = small.resize((W, H), Image.BICUBIC)
+    bg = ImageEnhance.Color(bg).enhance(0.3)
+    bg = ImageEnhance.Brightness(bg).enhance(0.6)
+    return bg.convert("RGBA")
+
+
+def _album(thumb):
+    """512x512 rounded album art, centre-cropped from the cover."""
+    size, radius, ss = 512, 38, 4
+    art = ImageOps.fit(thumb, (size, size), Image.LANCZOS, centering=(0.5, 0.5)).convert("RGBA")
+    mask = Image.new("L", (size * ss, size * ss), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size * ss - 1, size * ss - 1), radius=radius * ss, fill=255)
+    art.putalpha(mask.resize((size, size), Image.LANCZOS))
+    return art
+
+
+# ---------------------------------------------------------------- icons (1x coordinates)
+def _sx(v):
+    return v * S
+
+
+def _tri(d, pts, color, r=2.2):
+    p = [(_sx(x), _sx(y)) for x, y in pts]
+    d.polygon(p, fill=color)
+    d.line(p + [p[0]], fill=color, width=int(r * 2 * S), joint="curve")
+
+
+def _pill(d, x0, y0, x1, y1, fill):
+    d.rounded_rectangle((_sx(x0), _sx(y0), _sx(x1), _sx(y1)), radius=_sx((y1 - y0) / 2), fill=fill)
+
+
+def _dot(d, x, y, r, fill):
+    d.ellipse((_sx(x - r), _sx(y - r), _sx(x + r), _sx(y + r)), fill=fill)
+
+
+def _star(d, cx, cy, ro, ri, color, w):
+    pts = []
+    for i in range(10):
+        ang = math.radians(-90 + i * 36)
+        r = ro if i % 2 == 0 else ri
+        pts.append((_sx(cx + r * math.cos(ang)), _sx(cy + r * math.sin(ang))))
+    d.line(pts + [pts[0]], fill=color, width=int(w * S), joint="curve")
+
+
+def _speaker(d, x, cy, waves, color):
+    d.rounded_rectangle((_sx(x), _sx(cy - 3.6), _sx(x + 6), _sx(cy + 3.6)), radius=_sx(1.2), fill=color)
+    d.polygon([(_sx(x + 4), _sx(cy - 3.6)), (_sx(x + 13), _sx(cy - 10)),
+               (_sx(x + 13), _sx(cy + 10)), (_sx(x + 4), _sx(cy + 3.6))], fill=color)
+    if waves:
+        cx = _sx(x + 14)
+        for r in (5.5, 10.0, 14.5):
+            R = _sx(r)
+            d.arc((cx - R, _sx(cy) - R, cx + R, _sx(cy) + R), start=-48, end=48, fill=color, width=int(2.3 * S))
+
+
+def _lyrics(d, color):
+    x, y = 817, 565
+    d.rounded_rectangle((_sx(x + 1.6), _sx(y + 1.6), _sx(x + 34.4), _sx(y + 26)), radius=_sx(7), outline=color, width=int(3.2 * S))
+    d.polygon([(_sx(x + 8), _sx(y + 24)), (_sx(x + 8), _sx(y + 35)), (_sx(x + 19), _sx(y + 24))], fill=color)
+    for qx in (12.5, 24.0):
+        _dot(d, x + qx, y + 12, 3.5, color)
+        d.line([(_sx(x + qx + 2.6), _sx(y + 12.5)), (_sx(x + qx - 0.4), _sx(y + 19))], fill=color, width=int(2.4 * S))
+
+
+def _list(d, color):
+    x, y = 1024, 567
+    for ly in (2.3, 13.5, 24.7):
+        _dot(d, x + 2.6, y + ly, 2.6, color)
+        _pill(d, x + 9, y + ly - 2.4, x + 37, y + ly + 2.4, color)
+
+
+# ---------------------------------------------------------------- card
+def render_card(thumb, title, artist, duration, bot_name="Music Bot", played=3):
     thumb = thumb.convert("RGB")
+    base = _background(thumb)
+    base.alpha_composite(_album(thumb), (100, 104))
 
-    # background: blurred, slightly darkened cover
-    bg = ImageOps.fit(thumb, (W // 2, H // 2)).filter(ImageFilter.GaussianBlur(9))
-    bg = bg.resize((Wk, Hk), Image.LANCZOS)
-    bg = ImageEnhance.Brightness(bg).enhance(0.7)
-    base = bg.convert("RGBA")
+    ui = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(ui)
 
-    # glass panel
-    cx0, cy0, cx1, cy1, cr = 220, 140, 1060, 580, 42
-    box = (cx0 * k, cy0 * k, cx1 * k, cy1 * k)
-    panel_mask = Image.new("L", (Wk, Hk), 0)
-    ImageDraw.Draw(panel_mask).rounded_rectangle(box, radius=cr * k, fill=255)
-    frosted = base.filter(ImageFilter.GaussianBlur(14 * k))
-    frosted = ImageEnhance.Brightness(frosted).enhance(0.72)
-    base.paste(frosted, (0, 0), panel_mask)
-    tint = Image.new("RGBA", (Wk, Hk), (0, 0, 0, 0))
-    ImageDraw.Draw(tint).rounded_rectangle(box, radius=cr * k, fill=(10, 10, 20, 70))
-    base.alpha_composite(tint)
-    _glow_ring(base, _gradient_ring((Wk, Hk), box, cr * k, int(4 * k), BORDER), 10 * k, 1.6)
+    f_title = _font("pc_inter_bold.otf", 22.8)
+    f_artist = _font("pc_inter_regular.otf", 22)
+    f_time = _font("pc_inter_bold.otf", 18)
+    f_rem = _font("pc_inter_regular.otf", 18)
+    f_chip = _font("pc_inter_regular.otf", 14)
 
-    # album art with its own gradient ring
-    ax0, ay0, ax1, ay1, ar = 262, 192, 598, 528, 30
-    art = ImageOps.fit(thumb, ((ax1 - ax0) * k, (ay1 - ay0) * k), centering=(0.5, 0.5))
-    art_mask = Image.new("L", art.size, 0)
-    ImageDraw.Draw(art_mask).rounded_rectangle((0, 0, art.size[0] - 1, art.size[1] - 1), radius=ar * k, fill=255)
-    base.paste(art, (ax0 * k, ay0 * k), art_mask)
-    abox = (ax0 * k, ay0 * k, ax1 * k, ay1 * k)
-    _glow_ring(base, _gradient_ring((Wk, Hk), abox, ar * k, int(3 * k), BORDER), 6 * k, 1.3)
+    total = _secs(duration)
+    title = _fit(d, _safe_text(title), f_title, 262)
+    artist = _fit(d, _safe_text(artist), f_artist, 300)
 
-    d = ImageDraw.Draw(base)
-    f_title = _font("font2.ttf", 37)
-    f_artist = _font("pc_bold.ttf", 25)
-    f_time = _font("pc_bold.ttf", 19)
+    # title / artist
+    d.text((_sx(727), _sx(144.5)), title, font=f_title, fill=WHITE, anchor="ls")
+    d.text((_sx(728), _sx(184)), artist, font=f_artist, fill=(200, 200, 200, 255), anchor="ls")
 
-    title = _fit_text(d, _safe_text(title).upper(), f_title, 400)
-    artist = _fit_text(d, _safe_text(artist), f_artist, 395)
-    d.text((640 * k, 228 * k), title, font=f_title, fill=(255, 255, 255, 255))
-    d.text((640 * k, 296 * k), artist, font=f_artist, fill=(215, 215, 215, 255))
+    # star + more buttons
+    for cx in (1067.5, 1140.0):
+        r = 22.8
+        d.ellipse((_sx(cx - r), _sx(145.5 - r), _sx(cx + r), _sx(145.5 + r)), fill=(255, 255, 255, 92))
+    _star(d, 1067.5, 145.5, 12.6, 5.3, WHITE, 2.2)
+    for dy in (-9, 0, 9):
+        _dot(d, 1140, 145.5 + dy, 2.7, WHITE)
 
     # progress bar
-    total = 0
-    try:
-        total = sum(int(x) * 60 ** i for i, x in enumerate(reversed(str(duration).split(":"))))
-    except Exception:
-        total = 0
-    frac = 0.22
-    px0, px1, py = 640, 1020, 400
-    knob = px0 + (px1 - px0) * frac
-    d.rounded_rectangle((px0 * k, (py - 3) * k, px1 * k, (py + 3) * k), radius=3 * k, fill=(205, 205, 205, 255))
-    d.rounded_rectangle((px0 * k, (py - 3) * k, knob * k, (py + 3) * k), radius=3 * k, fill=GREEN)
-    d.ellipse(((knob - 10) * k, (py - 10) * k, (knob + 10) * k, (py + 10) * k), fill=(255, 255, 255, 255))
-    cur = int(total * frac)
-    cur_txt = f"{cur // 60:02d}:{cur % 60:02d}"
-    dur_txt = str(duration or "0:00")
-    d.text((640 * k, 422 * k), cur_txt, font=f_time, fill=(255, 255, 255, 255))
-    d.text((px1 * k - d.textlength(dur_txt, font=f_time), 422 * k), dur_txt, font=f_time, fill=(255, 255, 255, 255))
+    x0, x1, y0, y1 = 718, 1161, 218, 230
+    _pill(d, x0, y0, x1, y1, (255, 255, 255, 82))
+    frac = min(1.0, played / total) if total else 0.0
+    fx = x0 + max(14, (x1 - x0) * frac)
+    _pill(d, x0, y0, fx, y1, (244, 244, 244, 255))
+    d.rectangle((_sx(x0 + 6), _sx(y0), _sx(fx), _sx(y1)), fill=(244, 244, 244, 255))  # flat right end
 
-    _icon_row(d, 500, k)
-    return base.convert("RGB").resize((W, H), Image.LANCZOS)
+    # times
+    d.text((_sx(716), _sx(266)), _fmt(played), font=f_time, fill=(208, 208, 208, 255), anchor="ls")
+    rem = f"-{_fmt(total - played)}" if total else "LIVE"
+    d.text((_sx(1155), _sx(266)), rem, font=f_rem, fill=(196, 196, 196, 255), anchor="rs")
+
+    # bot name chip
+    name = _fit(d, bot_name, f_chip, 150)
+    tw = d.textlength(name, font=f_chip) / S
+    cw, cx = tw + 24, 925
+    d.rounded_rectangle((_sx(cx - cw / 2), _sx(246), _sx(cx + cw / 2), _sx(265)), radius=_sx(4.5), fill=(255, 255, 255, 64))
+    d.text((_sx(cx), _sx(259.5)), name, font=f_chip, fill=(214, 214, 214, 255), anchor="ms")
+
+    # transport: rewind, pause, forward
+    _tri(d, [(781, 359.5), (746.5, 379.7), (781, 399.8)], ICON)
+    _tri(d, [(814, 359.5), (781.5, 379.7), (814, 399.8)], ICON)
+    d.rounded_rectangle((_sx(913), _sx(348), _sx(934), _sx(411)), radius=_sx(5), fill=ICON)
+    d.rounded_rectangle((_sx(944), _sx(348), _sx(965), _sx(411)), radius=_sx(5), fill=ICON)
+    _tri(d, [(1065, 359.5), (1098, 379.7), (1065, 399.8)], ICON)
+    _tri(d, [(1099, 359.5), (1131, 379.7), (1099, 399.8)], ICON)
+
+    # volume
+    _pill(d, 766, 493, 1094, 504, (242, 242, 242, 255))
+    _speaker(d, 725, 498.5, False, (236, 236, 236, 255))
+    _speaker(d, 1120, 498.5, True, (236, 236, 236, 255))
+
+    # bottom icons
+    _lyrics(d, (240, 240, 240, 255))
+    _list(d, (240, 240, 240, 255))
+
+    ui = ui.resize((W, H), Image.LANCZOS)
+    base.alpha_composite(ui)
+    return base.convert("RGB")
 
 
 # ---------------------------------------------------------------- data + public API
+def _strip_bars(img):
+    """hqdefault is 4:3 with black bars -> crop to the real 16:9 picture."""
+    w, h = img.size
+    if abs(w / h - 4 / 3) < 0.05:
+        nh = int(w * 9 / 16)
+        top = (h - nh) // 2
+        img = img.crop((0, top, w, top + nh))
+    return img
+
+
 async def _fetch(videoid):
     from youtubesearchpython.__future__ import VideosSearch
 
@@ -390,32 +256,65 @@ async def _fetch(videoid):
         print(f"[PLAYERCARD] info fetch failed: {e}")
 
     thumb = None
-    for name in ("hqdefault", "mqdefault"):
+    for name in ("maxresdefault", "hq720", "hqdefault", "mqdefault"):
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as s:
                 async with s.get(f"https://i.ytimg.com/vi/{videoid}/{name}.jpg") as resp:
                     if resp.status == 200:
-                        thumb = Image.open(BytesIO(await resp.read())).convert("RGB")
+                        thumb = _strip_bars(Image.open(BytesIO(await resp.read())).convert("RGB"))
                         break
         except Exception as e:
-            print(f"[PLAYERCARD] thumb fetch failed: {e}")
+            print(f"[PLAYERCARD] thumb fetch failed ({name}): {e}")
     if thumb is None:
-        thumb = Image.new("RGB", (480, 360), (40, 40, 48))
+        thumb = Image.new("RGB", (640, 360), (60, 60, 68))
     return title, artist, duration, thumb
 
 
+def prune_cache(keep=KEEP_FILES, max_age=MAX_AGE, protect=None):
+    """Delete old player cards (and leftover .png cards) so storage never fills up."""
+    try:
+        now = time.time()
+        files = []
+        for f in glob.glob(CARD_GLOB):
+            try:
+                files.append((os.path.getmtime(f), f))
+            except OSError:
+                pass
+        files.sort(reverse=True)
+        for i, (mt, f) in enumerate(files):
+            if f == protect:
+                continue
+            if f.endswith(".png") or i >= keep or now - mt > max_age:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
 async def make_player_card(videoid, user_id=None):
-    os.makedirs("cache", exist_ok=True)
-    out = f"cache/roohi_{videoid}.png"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    out = os.path.join(CACHE_DIR, f"roohi_{videoid}.jpg")
     if os.path.exists(out):
+        os.utime(out, None)  # still in use -> keep it fresh
         return out
     try:
         title, artist, duration, thumb = await _fetch(videoid)
+        bot = _bot_name()
         loop = asyncio.get_running_loop()
-        img = await loop.run_in_executor(None, render_card, thumb, title, artist, duration)
-        img.save(out, "PNG")
+
+        def _build():
+            img = render_card(thumb, title, artist, duration, bot)
+            tmp = out + ".tmp"
+            img.save(tmp, "JPEG", quality=JPEG_QUALITY, optimize=True, progressive=True, subsampling=0)
+            os.replace(tmp, out)
+
+        await loop.run_in_executor(None, _build)
+        await loop.run_in_executor(None, prune_cache, KEEP_FILES, MAX_AGE, out)
         return out
     except Exception as e:
         print(f"[PLAYERCARD] render failed: {e}")
         return None
+    
