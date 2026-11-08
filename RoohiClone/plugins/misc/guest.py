@@ -6,7 +6,7 @@ from pyrogram.types import (
     Message,
 )
 
-from Roohiclone import app
+from RoohiClone import app
 
 
 # ==========================================================
