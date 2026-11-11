@@ -15,18 +15,22 @@ from youtubesearchpython.__future__ import VideosSearch, Playlist
 DOWNLOAD_DIR = "downloads"
 LOGGER = logging.getLogger("BETA BOT HUB | 👑 THE SHIV")
 
-# 🟢 Primary API (Shruti)
 def _clean_url(val):
     val = str(val or "").strip()
-    if val.lower().startswith("to "):          # old typo: " to https://..."
+    if val.lower().startswith("to "):
         val = val[3:].strip()
     return val.rstrip("/")
 
-SHRUTI_API_URL = _clean_url(
-    os.environ.get("SHRUTI_API_URL") or getattr(config, "API_URL", "") or "https://api.shrutibots.in"
+# 🟢 Primary (and only) API: BETA API
+BETA_API_URL = _clean_url(
+    os.environ.get("BETA_API_URL")
+    or getattr(config, "BETA_API_URL", "")
+    or "https://beta.13.54.201.131.sslip.io/v1"
 )
-SHRUTI_API_KEY = (
-    os.environ.get("SHRUTI_API_KEY") or getattr(config, "API_KEY", "") or "ShrutiBots7Yo5iWyWiyQKME4mrS6r"
+BETA_API_KEY = (
+    os.environ.get("BETA_API_KEY")
+    or getattr(config, "BETA_API_KEY", "")
+    or "beta_test_Pts-Iz30r0BYNS-qX0UbMilIAzLRjWgi__d0UfRnbro"
 )
 
 # Optional cookies.txt for the yt-dlp fallback (age/bot-check videos)
@@ -59,26 +63,31 @@ async def _async_run(func, *args, **kwargs):
 
 # ----------------- DOWNLOADERS -----------------
 
-async def external_api_download(api_url: str, api_key: str, video_id: str, download_type: str, title: str = None, api_name: str = "Shruti") -> str:
+async def beta_api_download(video_id: str, download_type: str, title: str = None) -> str:
+    api_url, api_key = BETA_API_URL, BETA_API_KEY
     if not api_url or not api_key:
-        LOGGER.error(f"🔴 {api_name} API URL or API Key is missing!")
+        LOGGER.error("🔴 BETA API URL or API Key is missing!")
         return None
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    filename = get_safe_filename(title, f"{api_name[:3]}_{video_id}")
+    filename = get_safe_filename(title, f"BETA_{video_id}")
     ext = "mp4" if download_type == "video" else "mp3"
     file_path = os.path.join(DOWNLOAD_DIR, f"{filename}.{ext}")
 
-    # one download per file at a time (two users asking the same song used to corrupt the file)
+    # one download per file at a time
     lock = _DL_LOCKS.setdefault(file_path, asyncio.Lock())
     async with lock:
         if os.path.exists(file_path) and os.path.getsize(file_path) > 50000:
             return file_path
 
         tmp_path = file_path + ".part"
+        headers = {
+            "X-API-Key": api_key,
+            "Authorization": f"Bearer {api_key}",
+        }
         for attempt in range(1, 3):
             try:
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(headers=headers) as session:
                     params = {
                         "url": video_id,
                         "type": "audio" if download_type == "audio" else "video",
@@ -90,8 +99,7 @@ async def external_api_download(api_url: str, api_key: str, video_id: str, downl
                         timeout=aiohttp.ClientTimeout(total=600, connect=20),
                     ) as resp:
                         if resp.status != 200:
-                            LOGGER.error(f"🔴 {api_name} Error: Status {resp.status}")
-                            # 401/403/404 will not fix themselves - go straight to fallback
+                            LOGGER.error(f"🔴 BETA API Error: Status {resp.status}")
                             if resp.status in (401, 403, 404, 429):
                                 return None
                             await asyncio.sleep(1.5)
@@ -103,12 +111,12 @@ async def external_api_download(api_url: str, api_key: str, video_id: str, downl
 
                 if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 50000:
                     os.replace(tmp_path, file_path)
-                    LOGGER.info(f"🟢 SUCCESS: Downloaded '{title}' from {api_name}!")
+                    LOGGER.info(f"🟢 SUCCESS: Downloaded '{title}' from BETA API!")
                     return file_path
 
-                LOGGER.warning(f"🔴 {api_name} returned corrupted/empty file for '{title}'. Rejecting it.")
+                LOGGER.warning(f"🔴 BETA API returned corrupted/empty file for '{title}'. Rejecting it.")
             except Exception as e:
-                LOGGER.error(f"{api_name} Download Error: {e}")
+                LOGGER.error(f"BETA API Download Error: {e}")
                 await asyncio.sleep(1.5)
             finally:
                 if os.path.exists(tmp_path):
@@ -141,7 +149,6 @@ def _ytdlp_download_sync(video_id: str, download_type: str, title: str = None):
     if YT_COOKIES and os.path.isfile(YT_COOKIES):
         opts["cookiefile"] = YT_COOKIES
     if download_type == "video":
-        # 720p max (VC streams 720p), mp4 container so ffmpeg/pytgcalls can read it
         opts["format"] = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best"
         opts["merge_output_format"] = "mp4"
     else:
@@ -188,11 +195,11 @@ async def _download_media(link: str, title: str, kind: str):
 
     title = await _resolve_title(video_id, title)
 
-    result = await external_api_download(SHRUTI_API_URL, SHRUTI_API_KEY, video_id, kind, title, "Shruti")
+    result = await beta_api_download(video_id, kind, title)
     if result:
         return result
 
-    LOGGER.warning(f"🟡 Shruti API failed for {kind} '{title}'. Trying yt-dlp fallback...")
+    LOGGER.warning(f"🟡 BETA API failed for {kind} '{title}'. Trying yt-dlp fallback...")
     result = await ytdlp_download(video_id, kind, title)
     if result:
         LOGGER.info(f"🟢 SUCCESS: Downloaded '{title}' ({kind}) from yt-dlp fallback!")
@@ -208,8 +215,6 @@ async def download_song(link: str, title: str = None) -> str:
 
 async def download_video(link: str, title: str = None) -> str:
     return await _download_media(link, title, "video")
-
-
 # ----------------- YOUTUBE API CLASS -----------------
 
 class YouTubeAPI:
